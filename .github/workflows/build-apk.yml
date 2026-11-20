@@ -211,7 +211,7 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          import re
+          from html.parser import HTMLParser
           p=Path('www/index.html')
           s=p.read_text(encoding='utf-8')
           if 'id="dr-patil-pdf-generator-v2"' in s: raise SystemExit('Refusing duplicate PDF bridge injection')
@@ -326,43 +326,50 @@ jobs:
             document.addEventListener('visibilitychange',function(){if(!document.hidden&&state!=='connected')start();});
           })();
           </script>'''
-          if '</body>' not in s: raise SystemExit('V25 closing body tag missing')
-          s=s.replace('</body>',bridge+'\n</body>',1)
+          # The V25 preview function contains the literal text '</body>'
+          # inside a JavaScript string used to build iframe srcdoc HTML.
+          # Replacing the first occurrence corrupts that JavaScript string and
+          # injects the bridge into the middle of the script. Insert only before
+          # the final, actual document closing body tag instead.
+          body_close=s.rfind('</body>')
+          if body_close < 0: raise SystemExit('V25 closing body tag missing')
+          s=s[:body_close]+bridge+'\n'+s[body_close:]
           p.write_text(s,encoding='utf-8')
           checks=['src="html2pdf.bundle.min.js"','id="dr-patil-pdf-generator-v2"','PDF diagnostic 1/3: JavaScript loaded','javascriptLoaded:true','DR_PATIL_PDF_BRIDGE_READY_V2','window.AndroidPrint.sharePdf(base64','window.AndroidPrint.print()','collectV25PrintStyles()','css.textContent=collectV25PrintStyles();','id="print"','id="share"','id="printFollowup"','data-print-fu','data-direct-preview','data-preop-preview']
           missing=[x for x in checks if x not in s]
           if missing: raise SystemExit('PDF bridge verification failed: '+', '.join(missing))
-          from html.parser import HTMLParser
-          class InlineScriptExtractor(HTMLParser):
+          # Do not use a regular expression to extract script tags. V25 contains
+          # JavaScript template strings with literal '<script ...>' markup; a regex
+          # mistakes that markup for real HTML script elements and truncates code.
+          class ScriptExtractor(HTMLParser):
               def __init__(self):
                   super().__init__(convert_charrefs=False)
                   self.in_script=False
-                  self.external=False
                   self.current=[]
                   self.scripts=[]
               def handle_starttag(self, tag, attrs):
-                  if tag.lower()=='script':
+                  if tag.lower()=='script' and not self.in_script:
                       self.in_script=True
-                      self.external=any(k.lower()=='src' for k,v in attrs)
                       self.current=[]
               def handle_data(self, data):
-                  if self.in_script and not self.external:
+                  if self.in_script:
                       self.current.append(data)
               def handle_endtag(self, tag):
                   if tag.lower()=='script' and self.in_script:
-                      if not self.external:
-                          code=''.join(self.current)
-                          if code.strip():
-                              self.scripts.append(code)
-                      self.in_script=False
-                      self.external=False
+                      self.scripts.append(''.join(self.current))
                       self.current=[]
-          extractor=InlineScriptExtractor()
+                      self.in_script=False
+          extractor=ScriptExtractor()
           extractor.feed(s)
-          if not extractor.scripts: raise SystemExit('No inline JavaScript scripts were found for syntax validation')
-          for index,code in enumerate(extractor.scripts):
-              Path(f'/tmp/drpatil-v25-script-{index}.js').write_text(code,encoding='utf-8')
-          print('Extracted',len(extractor.scripts),'actual inline script elements for syntax validation.')
+          extractor.close()
+          scripts=[x for x in extractor.scripts if x.strip()]
+          if not scripts: raise SystemExit('No executable JavaScript script blocks found')
+          out=Path('/tmp/drpatil-v25-js-check')
+          out.mkdir(parents=True,exist_ok=True)
+          for old_file in out.glob('script-*.js'): old_file.unlink()
+          for i,script in enumerate(scripts):
+              (out/f'script-{i:03d}.js').write_text(script,encoding='utf-8')
+          print(f'Extracted {len(scripts)} actual HTML script blocks for independent syntax checks.')
           print('All existing V25 digital PDF routes now generate a PDF and open Android share/save options.')
           PY
 
@@ -370,12 +377,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test -d /tmp/drpatil-v25-js-check
           shopt -s nullglob
-          scripts=(/tmp/drpatil-v25-script-*.js)
-          test ${#scripts[@]} -gt 0
-          for script in "${scripts[@]}"; do
-            echo "Checking JavaScript syntax: $script"
-            node --check "$script"
+          JS_FILES=(/tmp/drpatil-v25-js-check/script-*.js)
+          test ${#JS_FILES[@]} -gt 0
+          for js in "${JS_FILES[@]}"; do
+            echo "Checking actual JavaScript block: $js"
+            node --check "$js"
           done
           python3 - <<'PY'
           from pathlib import Path
