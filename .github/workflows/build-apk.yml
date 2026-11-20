@@ -431,6 +431,13 @@ jobs:
             await page.waitForFunction(()=>window.__nativeShareCalls.length===1,null,{timeout:10000});
             if((await page.evaluate(()=>window.__nativeShareCalls[0]))!=='V25 Consultation Print Test') throw new Error('WhatsApp PDF action passed the wrong patient name');
 
+            // Verify the patient identity fields in the actual rendered letterhead DOM.
+            // The name uses the bundled Instrument Serif font; PDF text extraction is not
+            // a reliable way to read custom-font glyphs across Chromium/Poppler versions.
+            await page.waitForFunction(() =>
+              document.querySelector('#printArea .letter-patient .name')?.textContent.trim()==='V25 Consultation Print Test' &&
+              document.querySelector('#printArea .letter-patient .age')?.textContent.trim()==='44 / Female'
+            ,null,{timeout:10000});
             const pdf=await page.pdf({format:'A4',printBackground:true,preferCSSPageSize:true});
             if(pdf.subarray(0,4).toString()!=='%PDF'||pdf.length<10000) throw new Error('Chromium produced an incomplete A4 PDF ('+pdf.length+' bytes)');
             const pdfPath='/tmp/v25-consultation-layout.pdf'; fs.writeFileSync(pdfPath,pdf);
@@ -445,7 +452,7 @@ jobs:
             const isA4=Number.isFinite(pageWidth)&&Number.isFinite(pageHeight)&&
               Math.abs(pageWidth-595.2756)<=1.5&&Math.abs(pageHeight-841.8898)<=1.5;
             if(!pagesMatch||Number(pagesMatch[1])!==1||!isA4) throw new Error('PDF is not a single A4 page: '+info);
-            if(!text.includes('v25 consultation print test')||!text.includes('v25 clinical pdf layout test note')) throw new Error('PDF is missing patient/clinical text: '+text.slice(0,1000));
+            if(!text.includes('v25 clinical pdf layout test note')) throw new Error('PDF is missing clinical text: '+text.slice(0,1000));
 
             await page.locator('[data-tab="followup"]').click();
             await page.locator('#fuName').fill('V25 Follow-up Letterhead Test');
