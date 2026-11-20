@@ -41,11 +41,11 @@ jobs:
           import hashlib
           p=Path('DrPatil_Digital_OPD_V25_Final.html')
           s=p.read_text(encoding='utf-8')
-          required=['id="print"','id="share"','id="printFollowup"','id="printArea"','window.print()','data-print-fu','data-direct-preview','data-preop-preview','exportCompleteBackup','dpod_records','dpod_followups','dpod_medicine_library','dpod_settings','dpod_preoperative_patients','dpod_reference_doctor_library','function printWithMode(mode, data, follow=false)','window.__opdPreviousDocumentTitle']
+          required=['id="print"','id="share"','id="printFollowup"','id="printArea"','window.print()','data-print-fu','data-direct-preview','data-preop-preview','exportCompleteBackup','dpod_records','dpod_followups','dpod_medicine_library','dpod_settings','dpod_preoperative_patients','dpod_reference_doctor_library','function printWithMode(mode, data, follow=false)','window.__opdPreviousDocumentTitle','id="printFollowupLetterhead"','window.showPdfPreview=function(markup)','collectLetterheadRules','const fletter=byId(\'printFollowupLetterhead\')','printWithMode(\'physical\',x,true)']
           missing=[x for x in required if x not in s]
           if missing: raise SystemExit('V25 source validation failed: '+', '.join(missing))
           actual=hashlib.sha256(p.read_bytes()).hexdigest()
-          expected='b0e953bb6cd4ca955894c1a63bf7946f3e27d4079572c131839eb4e4c7819b52'
+          expected='83b551985c855eac9938257445f6aee7fddcd4942acfb27f726759c0e46232d7'
           if actual!=expected: raise SystemExit('V25 final source checksum mismatch: '+actual)
           print('V25 final source checksum verified:',actual)
           print('V25 bytes:',p.stat().st_size)
@@ -401,24 +401,28 @@ jobs:
           PY
 
 
-      - name: Run Chromium PDF generation smoke test
+      - name: Run Chromium PDF generation and real V25 route smoke tests
         shell: bash
         run: |
           set -euo pipefail
           npm install --no-audit --no-fund --no-save playwright@1.56.1
           npx playwright install --with-deps chromium
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils tesseract-ocr
           cat > /tmp/drpatil-pdf-smoke.cjs <<'JS'
           const { chromium } = require('playwright');
-          const path = require('path');
+          const fs = require('fs');
+          const { execFileSync } = require('child_process');
           (async () => {
             const browser = await chromium.launch({ headless: true });
-            const page = await browser.newPage({ viewport: { width: 794, height: 1123 } });
+            const page = await browser.newPage({ viewport: { width: 794, height: 1123 }, deviceScaleFactor: 1 });
             const pageErrors = [];
             page.on('pageerror', e => pageErrors.push(e.message));
             await page.addInitScript(() => {
+              window.__nativePrintCount = 0;
               window.AndroidPrint = {
                 ping: () => 'DR_PATIL_PDF_BRIDGE_READY_V2',
-                print: () => { window.__nativePrintCalled = true; },
+                print: () => { window.__nativePrintCount++; },
                 sharePdf: (encoded, patient) => { window.__sharedPdf = { encoded, patient }; }
               };
             });
@@ -426,50 +430,85 @@ jobs:
             await page.waitForFunction(() => window.__drPatilPdfBridgeState === 'connected', null, { timeout: 30000 });
             await page.waitForFunction(() => typeof window.html2pdf === 'function', null, { timeout: 30000 });
 
-            const routeInfo = await page.evaluate(() => ({
-              consultationPrint: !!document.getElementById('print'),
-              consultationShare: !!document.getElementById('share'),
-              followupPrint: !!document.getElementById('printFollowup'),
-              patientRecordPreviewRouteInSource: document.documentElement.innerHTML.includes('data-direct-preview'),
-              followupHistoryPrintRouteInSource: document.documentElement.innerHTML.includes('data-print-fu'),
-              preopPreviewRouteInSource: document.documentElement.innerHTML.includes('data-preop-preview')
+            const required = await page.evaluate(() => ({
+              consultationPhysicalButton: !!document.getElementById('print'),
+              consultationWhatsAppButton: !!document.getElementById('share'),
+              followupDigitalButton: !!document.getElementById('printFollowup'),
+              followupLetterheadButton: !!document.getElementById('printFollowupLetterhead'),
+              previewFunction: typeof window.showPdfPreview === 'function',
+              previewRoutes: document.documentElement.innerHTML.includes('data-direct-preview') &&
+                document.documentElement.innerHTML.includes('data-preop-preview') &&
+                document.documentElement.innerHTML.includes('data-fupreview')
             }));
-            if (!Object.values(routeInfo).every(Boolean)) throw new Error('One or more V25 PDF routes are missing: ' + JSON.stringify(routeInfo));
+            if (!Object.values(required).every(Boolean)) throw new Error('Required V25 controls/routes missing: '+JSON.stringify(required));
 
+            // Exercise the actual V25 preview function and verify the A4 letterhead layout.
             await page.evaluate(() => {
-              const area = document.getElementById('printArea');
-              area.innerHTML = '<section class="letter-page physical"><div class="letter-patient"><div class="v name">Physical Print Test</div></div><div class="letter-clinical"><h3>Clinical note</h3><p>Native print bridge smoke test.</p></div></section>';
-              window._opdPrintMode = 'physical';
-              window.print();
+              const sample={name:'Preview Layout Test',age:'44',sex:'Female',date:'2026-11-20',mobile:'9876543210',ref:'',complaints:['Bleeding Per Anum'],complaintDurations:{'Bleeding Per Anum':'5 days'},hpi:['History of bleeding per anum.'],hpiExtra:'Preview clinical text must remain inside the letterhead writing area.',history:'',exam:'',investigations:'',diagnosis:'',diagnoses:[],plan:'',medicines:[],advice:'',format:'traditional'};
+              window._opdPrintMode='digital';
+              window.showPdfPreview(window.doc(sample));
             });
-            await page.waitForFunction(() => window.__nativePrintCalled === true, null, { timeout: 10000 });
+            await page.waitForSelector('#opdPdfPreview iframe');
+            const frame = page.frameLocator('#opdPdfPreview iframe');
+            await frame.locator('.letter-page').waitFor({state:'visible',timeout:15000});
+            await frame.locator('.letter-bg').evaluate(img => img.decode());
+            const previewLayout = await frame.locator('.letter-page').evaluate(el => {
+              const c=el.querySelector('.letter-clinical');
+              const bg=el.querySelector('.letter-bg');
+              return {
+                pagePosition:getComputedStyle(el).position,
+                pageWidth:el.offsetWidth,
+                pageHeight:el.offsetHeight,
+                clinicalPosition:getComputedStyle(c).position,
+                clinicalTop:c.offsetTop,
+                clinicalLeft:c.offsetLeft,
+                letterheadPosition:bg?getComputedStyle(bg).position:'missing',
+                letterheadLoaded:!!(bg&&bg.complete&&bg.naturalWidth>0),
+                previewScale:el.style.transform
+              };
+            });
+            if(previewLayout.pagePosition!=='relative'||previewLayout.pageWidth<790||previewLayout.pageWidth>800||previewLayout.pageHeight<1115||previewLayout.pageHeight>1130||
+               previewLayout.clinicalPosition!=='absolute'||previewLayout.clinicalTop<350||previewLayout.clinicalTop>370||
+               previewLayout.clinicalLeft<200||previewLayout.clinicalLeft>215||previewLayout.letterheadPosition!=='absolute'||!previewLayout.letterheadLoaded||!previewLayout.previewScale.startsWith('scale('))
+              throw new Error('Preview does not reproduce the A4 letterhead layout: '+JSON.stringify(previewLayout));
+            await page.locator('#opdPdfPreview button').click();
 
-            await page.evaluate(() => {
-              const area = document.getElementById('printArea');
-              area.innerHTML = '<section class="letter-page digital"><div class="letter-patient"><div class="v name">PDF Smoke Test</div><div class="v age">40 / M</div></div><div class="letter-clinical"><h3>Clinical note</h3><p>V25 digital PDF generation verification.</p></div><div class="letter-signature">Doctor signature</div></section>';
-              window._opdPrintMode = 'digital';
-              window.print();
-            });
-            await page.waitForFunction(() => !!window.__sharedPdf, null, { timeout: 60000 });
-            const result = await page.evaluate(() => ({
-              encoded: window.__sharedPdf.encoded,
-              patient: window.__sharedPdf.patient,
-              diagnostics: window.__drPatilPdfDiagnostics
-            }));
-            const pdf = Buffer.from(result.encoded, 'base64');
-            if (pdf.subarray(0, 4).toString() !== '%PDF') throw new Error('PDF output does not have a valid PDF signature');
-            if (pdf.length < 1500) throw new Error('Generated PDF is unexpectedly small: ' + pdf.length);
-            if (result.patient !== 'PDF Smoke Test') throw new Error('Patient name was not passed to the native share bridge');
-            if (pageErrors.length) throw new Error('Browser JavaScript errors: ' + pageErrors.join(' | '));
-            console.log('V25 PDF smoke test passed:', JSON.stringify({
-              routes: routeInfo,
-              pdfBytes: pdf.length,
-              pdfHeader: pdf.subarray(0, 8).toString(),
-              patient: result.patient,
-              diagnostics: result.diagnostics
-            }));
+            // Exercise the real consultation pre-printed-letterhead button.
+            await page.locator('#name').fill('Physical Letterhead Smoke Test');
+            await page.locator('#print').click();
+            await page.waitForFunction(() => window.__nativePrintCount === 1, null, {timeout:10000});
+
+            // Exercise the real Save Complete PDF for WhatsApp button and inspect the generated PDF.
+            await page.locator('#hpiExtra').fill('Clinical text must be present in the generated A4 PDF.');
+            await page.locator('#share').click();
+            await page.waitForFunction(() => !!window.__sharedPdf, null, {timeout:60000});
+            const result = await page.evaluate(() => ({encoded:window.__sharedPdf.encoded,patient:window.__sharedPdf.patient}));
+            const pdf = Buffer.from(result.encoded,'base64');
+            if(pdf.subarray(0,4).toString()!=='%PDF') throw new Error('Generated document is not a valid PDF');
+            if(pdf.length<10000) throw new Error('Generated PDF is unexpectedly small: '+pdf.length+' bytes');
+            if(result.patient!=='Physical Letterhead Smoke Test') throw new Error('Patient name was not passed to PDF sharing');
+            const pdfPath='/tmp/drpatil-v25-real-document-smoke.pdf';
+            fs.writeFileSync(pdfPath,pdf);
+            const info=execFileSync('pdfinfo',[pdfPath],{encoding:'utf8'});
+            const pngPath='/tmp/drpatil-v25-real-document-smoke';
+            execFileSync('pdftoppm',['-png','-r','200','-f','1','-singlefile',pdfPath,pngPath]);
+            const extracted=execFileSync('tesseract',[pngPath+'.png','stdout','-l','eng'],{encoding:'utf8'});
+            const ocrText=extracted.replace(/\s+/g,' ').toLowerCase();
+            if(!/Pages:\s+1\b/.test(info)) throw new Error('Expected a one-page A4 prescription PDF: '+info);
+            if(!/Page size:\s+595\.\d+ x 841\.\d+ pts/.test(info)) throw new Error('PDF page is not A4 portrait: '+info);
+            if(!ocrText.includes('physical letterhead smoke test')||!ocrText.includes('clinical text must be present'))
+              throw new Error('Generated PDF is missing patient or clinical text: '+extracted);
+
+            // Exercise the actual follow-up pre-printed-letterhead button.
+            await page.locator('[data-tab="followup"]').click();
+            await page.locator('#fuName').fill('Follow-up Letterhead Smoke Test');
+            await page.locator('#printFollowupLetterhead').click();
+            await page.waitForFunction(() => window.__nativePrintCount === 2, null, {timeout:10000});
+
+            if(pageErrors.length) throw new Error('Browser JavaScript errors: '+pageErrors.join(' | '));
+            console.log('V25 real-route smoke test passed:',JSON.stringify({required,previewLayout,nativePrintCalls:2,pdfBytes:pdf.length,pdfInfo:info,extractedText:extracted}));
             await browser.close();
-          })().catch(e => { console.error(e); process.exit(1); });
+          })().catch(e=>{console.error(e);process.exit(1);});
           JS
           python3 -m http.server 4173 --directory www >/tmp/drpatil-http.log 2>&1 &
           SERVER_PID=$!
