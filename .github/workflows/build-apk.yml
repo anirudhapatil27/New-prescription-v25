@@ -45,7 +45,7 @@ jobs:
           missing=[x for x in required if x not in s]
           if missing: raise SystemExit('V25 source validation failed: '+', '.join(missing))
           actual=hashlib.sha256(p.read_bytes()).hexdigest()
-          expected='98596759e34163ef68ce67cd9a557a71137c9243170b7c32e73c6ccce8805c5e'
+          expected='b0e953bb6cd4ca955894c1a63bf7946f3e27d4079572c131839eb4e4c7819b52'
           if actual!=expected: raise SystemExit('V25 final source checksum mismatch: '+actual)
           print('V25 final source checksum verified:',actual)
           print('V25 bytes:',p.stat().st_size)
